@@ -1,10 +1,14 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS  # CORS importálása
 import requests
 import ibm_boto3
 from ibm_botocore.client import Config, ClientError
 import json
 
 app = Flask(__name__)
+
+# CORS engedélyezése az alkalmazás minden végpontján
+CORS(app)
 
 # IBM Cloud Object Storage configuration
 cos = ibm_boto3.client(
