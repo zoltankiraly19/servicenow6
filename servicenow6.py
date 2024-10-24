@@ -1,13 +1,11 @@
 from flask import Flask, request, jsonify
-from flask_cors import CORS  # CORS importálása
+from flask_cors import CORS
 import requests
 import ibm_boto3
 from ibm_botocore.client import Config, ClientError
 import json
 
 app = Flask(__name__)
-
-# CORS engedélyezése az alkalmazás minden végpontján
 CORS(app)
 
 # IBM Cloud Object Storage configuration
@@ -37,12 +35,13 @@ def get_session_data(file_name):
         print(f"Error retrieving {file_name}: {e}")
         return None
 
-# 1. Token megszerzése és háttéradatok lekérése
-@app.route('/login', methods=['POST'])
-def login():
+# 1. Token megszerzése és háttéradatok lekérése egyben (jegy létrehozásnál)
+@app.route('/create_ticket', methods=['POST'])
+def create_ticket():
     request_data = request.json
     username = request_data.get('username')
     password = request_data.get('password')
+    short_description = request_data.get('short_description')
 
     auth_data = {
         'grant_type': 'password',
@@ -52,14 +51,14 @@ def login():
         'password': password
     }
 
-    # Token megszerzése
+    # 1. Token megszerzése
     response = requests.post('https://dev227667.service-now.com/oauth_token.do', data=auth_data)
     
     if response.status_code == 200:
         access_token = response.json().get('access_token')
         store_session_data(f'{username}_token', access_token)
 
-        # Felhasználói sys_id lekérése és mentése COS-ba
+        # 2. Felhasználói sys_id lekérése és mentése COS-ba
         headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
         response_user = requests.get(
             f"https://dev227667.service-now.com/api/now/table/sys_user?sysparm_query=user_name={username}",
@@ -71,68 +70,44 @@ def login():
                 current_caller_id = users[0].get("sys_id")
                 store_session_data(f'{username}_caller_id', current_caller_id)
 
-        # Assignment groupok és prioritások lekérése
+        # 3. Assignment groupok és prioritások lekérése
         response_groups = requests.get('https://dev227667.service-now.com/api/now/table/sys_user_group', headers=headers)
         if response_groups.status_code == 200:
             groups = [{"name": group["name"], "sys_id": group["sys_id"]} for group in response_groups.json().get('result', [])]
-            store_session_data(f'{username}_assignment_groups', groups)
+        else:
+            return jsonify({"error": "Failed to fetch assignment groups"}), 400
 
         response_priorities = requests.get('https://dev227667.service-now.com/api/now/table/sys_choice?sysparm_query=name=incident^element=priority', headers=headers)
         if response_priorities.status_code == 200:
             priorities = [{"label": priority["label"], "value": priority["value"]} for priority in response_priorities.json().get('result', [])]
-            store_session_data(f'{username}_priorities', priorities)
+        else:
+            return jsonify({"error": "Failed to fetch priorities"}), 400
 
-        # Sikeres token megszerzés és adatlekérés után válaszolunk
-        return jsonify({"message": "Data retrieved and token stored successfully", "username": username}), 200
+        # 4. Válasszon csoportot és prioritást a felhasználó a lenyíló menüből
+        assignment_group_sys_id = request_data.get('assignment_group_sys_id')  # lenyíló lista alapján kiválasztott
+        priority = request_data.get('priority')  # lenyíló lista alapján kiválasztott
+
+        # 5. Jegy létrehozása ServiceNow-ban
+        current_caller_id = get_session_data(f'{username}_caller_id')
+        if not current_caller_id:
+            return jsonify({"error": "Caller ID not available. Please authenticate first."}), 400
+
+        ticket_data = {
+            "short_description": short_description,
+            "assignment_group": assignment_group_sys_id,
+            "priority": priority,
+            "caller_id": current_caller_id
+        }
+
+        response_ticket = requests.post('https://dev227667.service-now.com/api/now/table/incident', json=ticket_data, headers=headers)
+
+        if response_ticket.status_code == 201:
+            return jsonify({"message": "Ticket created successfully", "ticket_number": response_ticket.json().get('result', {}).get('number')}), 201
+        else:
+            return jsonify({"error": "Failed to create ticket", "details": response_ticket.text}), 400
+
     else:
         return jsonify({"error": "Authentication failed", "details": response.text}), 400
-
-# 2. Assignment Group és Priority lekérése a jegy létrehozása előtt
-@app.route('/get_ticket_data', methods=['GET'])
-def get_ticket_data():
-    username = request.args.get('username')
-
-    assignment_groups = get_session_data(f'{username}_assignment_groups')
-    priorities = get_session_data(f'{username}_priorities')
-
-    if assignment_groups and priorities:
-        return jsonify({
-            "assignment_groups": assignment_groups,
-            "priorities": priorities
-        }), 200
-    else:
-        return jsonify({"error": "No data available"}), 404
-
-# 3. Jegy létrehozása API kérés alapján
-@app.route('/create_ticket', methods=['POST'])
-def create_ticket():
-    request_data = request.json
-    username = request_data.get('username')
-    short_description = request_data.get('short_description')
-    assignment_group_sys_id = request_data.get('assignment_group_sys_id')
-    priority = request_data.get('priority')
-
-    access_token = get_session_data(f'{username}_token')
-    current_caller_id = get_session_data(f'{username}_caller_id')
-
-    if not access_token or not current_caller_id:
-        return jsonify({"error": "Token or Caller ID not available. Please authenticate first."}), 400
-
-    # Jegy létrehozása ServiceNow-ban
-    headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
-    ticket_data = {
-        "short_description": short_description,
-        "assignment_group": assignment_group_sys_id,
-        "priority": priority,
-        "caller_id": current_caller_id
-    }
-
-    response = requests.post('https://dev227667.service-now.com/api/now/table/incident', json=ticket_data, headers=headers)
-
-    if response.status_code == 201:
-        return jsonify({"message": "Ticket created successfully", "ticket_number": response.json().get('result', {}).get('number')}), 201
-    else:
-        return jsonify({"error": "Failed to create ticket", "details": response.text}), 400
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
